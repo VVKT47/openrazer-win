@@ -1,0 +1,115 @@
+name: Build installer
+
+# Builds OpenRazer Studio's installer from this branch, the way a release does,
+# and keeps it as a downloadable artifact. Nothing is published.
+
+on:
+  push:
+    branches: ['mouse-macros']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Windows, Python ${{ matrix.python-version }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest -q
+      - run: python studio/tools/check_translations.py
+
+  daemon:
+    name: Build the daemon
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Build the standalone executable
+        # A regular install, not editable: PyInstaller cannot follow imports
+        # through a PEP 660 editable finder.
+        run: |
+          pip install ".[ble]"
+          pip install pyinstaller
+          pyinstaller --clean --noconfirm packaging/openrazer-win.spec
+      - name: Smoke-test it
+        shell: pwsh
+        run: |
+          .\dist\openrazer-win.exe --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\dist\openrazer-win.exe macro --help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\dist\openrazer-win.exe doctor
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon
+          path: dist/openrazer-win.exe
+          if-no-files-found: error
+
+  studio:
+    name: Build OpenRazer Studio and its installer
+    needs: daemon
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: studio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: daemon
+          path: daemon
+      - name: Install Rust
+        # The version pinned in studio/rust-toolchain.toml.
+        run: rustup toolchain install
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build Studio
+        run: cargo build --release --locked -p openrazer-studio
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target/payload | Out-Null
+          Copy-Item target/release/openrazer-studio.exe target/payload/
+          Copy-Item ../daemon/openrazer-win.exe target/payload/
+          $env:OPENRAZER_STUDIO_PAYLOAD = "$PWD/target/payload"
+          cargo build --release --locked -p openrazer-studio-setup
+      - name: Install, repair and remove
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath target/release/openrazer-studio-setup.exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Error 'no program inside the installer'; exit 1 }
+          $env:LOCALAPPDATA = "$env:RUNNER_TEMP\lad"
+          ./tools/installer-cycle.ps1 -Setup target/release/openrazer-studio-setup.exe -Dir "$env:RUNNER_TEMP\studio-install"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force ../dist | Out-Null
+          Copy-Item target/release/openrazer-studio-setup.exe ../dist/
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openrazer-studio-setup
+          path: dist/openrazer-studio-setup.exe
+          if-no-files-found: error

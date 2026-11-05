@@ -302,7 +302,53 @@ class DaemonService:
         if not keys and getattr(getattr(device, 'info', None), 'dedicated_macro_keys', False):
             keys = ['M1', 'M2', 'M3', 'M4', 'M5']
         return {'keys': keys, 'bindings': self.macros.bindings(device.serial),
-                'handled': bool(self.keys is not None and self.keys.handles(device))}
+                'handled': bool(self.keys is not None and self.keys.handles(device)),
+                'options': self.macros.options()}
+
+    def rpc_macro_options(self, **changes) -> dict:
+        """Macro options -- record_mouse -- changed by whatever is passed."""
+        from ..keys import MacroError
+        try:
+            return self.macros.set_options(**changes) if changes else self.macros.options()
+        except MacroError as error:
+            raise RpcError(INVALID_PARAMS, str(error)) from error
+
+    def rpc_macro_import_synapse(self, path: Optional[str] = None, xml: Optional[str] = None,
+                                 codes: str = 'auto', numpad: bool = False,
+                                 keep_delays: bool = True, delay_ms: int = 0,
+                                 relative: bool = False, button_map: Optional[dict] = None,
+                                 serial: Optional[str] = None, key: Optional[str] = None,
+                                 index: int = 0) -> dict:
+        """Read a Razer Synapse macro export; with `serial` and `key`, bind one of its macros.
+
+        The file is read by the daemon, which runs as the same user on the same PC.
+        """
+        from ..keys import MacroError
+        from ..keys.synapse import SynapseError, parse
+        if (path is None) == (xml is None):
+            raise RpcError(INVALID_PARAMS, 'give either path or xml')
+        try:
+            mapping = {int(number): (tuple(value) if isinstance(value, list) else value)
+                       for number, value in (button_map or {}).items()}
+            macros = parse(path if path is not None else str(xml), codes=str(codes),
+                           numpad=bool(numpad), keep_delays=bool(keep_delays),
+                           delay_ms=int(delay_ms), relative=bool(relative), button_map=mapping)
+        except (SynapseError, ValueError) as error:
+            raise RpcError(INVALID_PARAMS, str(error)) from error
+        result: dict = {'macros': [macro.as_dict() for macro in macros]}
+        if serial is not None and key is not None:
+            if not 0 <= int(index) < len(macros):
+                raise RpcError(INVALID_PARAMS, 'the file has {0} macro(s)'.format(len(macros)))
+            chosen = macros[int(index)]
+            if not chosen.action['events']:
+                raise RpcError(INVALID_PARAMS, '{0!r} has nothing this port can play'.format(
+                    chosen.name))
+            device = self._device(serial)
+            try:
+                result['bound'] = self.macros.set(device.serial, str(key), chosen.action)
+            except MacroError as error:
+                raise RpcError(INVALID_PARAMS, str(error)) from error
+        return result
 
     def rpc_macro_set(self, serial: str, key: str, action: dict) -> dict:
         from ..keys import MacroError
@@ -322,18 +368,22 @@ class DaemonService:
         device = self._device(serial)
         return {'deleted': self.macros.delete(device.serial, str(key))}
 
-    def rpc_macro_record_start(self, serial: str, key: str) -> dict:
+    def rpc_macro_record_start(self, serial: str, key: str,
+                               mouse: Optional[bool] = None) -> dict:
+        """Record onto `key`; `mouse` takes the mouse too (None: the record_mouse option)."""
         device = self._device(serial)
         if self.keys is None or not self.keys.handles(device):
             raise RpcError(NOT_SUPPORTED,
                            'keys of {0} are not being handled'.format(device.name))
-        self.keys.start_recording(device.serial, str(key))
-        return {'recording': str(key)}
+        recording_mouse = self.keys.start_recording(
+            device.serial, str(key), None if mouse is None else bool(mouse))
+        return {'recording': str(key), 'mouse': recording_mouse}
 
-    def rpc_macro_record_stop(self) -> Optional[dict]:
+    def rpc_macro_record_stop(self, trim_click: bool = True) -> Optional[dict]:
+        """Stop and keep the recording.  `trim_click` drops a final click on a stop button."""
         if self.keys is None:
             return None
-        return self.keys.stop_recording()
+        return self.keys.stop_recording(bool(trim_click))
 
     def rpc_macro_play(self, serial: str, key: str) -> dict:
         device = self._device(serial)
@@ -504,6 +554,8 @@ class DaemonServer(socketserver.ThreadingTCPServer):
             'macro.record_start': service.rpc_macro_record_start,
             'macro.record_stop': service.rpc_macro_record_stop,
             'macro.play': service.rpc_macro_play,
+            'macro.options': service.rpc_macro_options,
+            'macro.import_synapse': service.rpc_macro_import_synapse,
         }
         self._shutdown_requested = threading.Event()
 

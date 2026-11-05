@@ -6,6 +6,36 @@ uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Macros made in Razer Synapse come across.** Export a macro from Synapse 2,
+  3 or 4 as `.xml`, then *Import from Synapse* in Studio's macro library, or
+  `openrazer-win macro import M1 "My macro.xml"`: its keys, clicks, scrolling,
+  cursor movement and pauses play as they did in Synapse. Synapse 2 and 3 store
+  scan codes and Synapse 4 virtual keys; which one a file holds is told from the
+  file. `macro import --dry-run` shows what is in one, and anything that could
+  not be brought over exactly is listed.
+- **Macros can record the mouse.** With *Record the mouse too* on a keyboard's
+  macro keys in Studio, `macro record M2 --mouse`, or `macro options
+  --record-mouse on` for Fn+F9, clicks, the wheel and the cursor's path are
+  recorded along with the keys. Movement is kept at most every 10 ms, and the
+  mouse is only watched while a recording runs.
+- Mouse movement plays back at the same places on the screen -- with every
+  monitor and display scaling taken into account -- or, with *From where the
+  cursor is* (`"moves": "relative"`), along the same path from wherever the
+  cursor is, which is what games that hide the cursor see.
+- A macro binding's events may now be mouse events (`{"mouse": "left", "down"}`,
+  `{"mouse": "move", "x", "y"}`, `{"mouse": "wheel", "amount"}`), and hold up to
+  10 000 of them. RPC: `macro.import_synapse`, `macro.options`, and a `mouse`
+  argument to `macro.record_start`.
+
+### Changed
+
+- Studio's macro editor keeps a macro that uses the mouse whole, rather than
+  only its keys, and says what the mouse does in it.
+- Stopping a recording from Studio no longer records the click on *Stop*, nor
+  the way the mouse went to it.
+
 ## [1.5.3] - 2026-11-04
 
 ### Added

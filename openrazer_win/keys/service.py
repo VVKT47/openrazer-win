@@ -36,9 +36,9 @@ from ..protocol.report import VENDOR_ID
 from .codes import (
     ACTIONS, IGNORED, MACRO_KEYS, MACRO_TARGETS, VK_LWIN, VK_RWIN, output_for, source_name,
 )
-from .hook import FilterHook, KeyEvent
+from .hook import FilterHook, KeyEvent, MouseEvent, MouseHook
 from .inject import Injector
-from .macros import MacroError, MacroStore
+from .macros import MAX_DELAY_MS, MAX_EVENTS, MOUSE_BUTTONS, RECORD_MOUSE, MacroError, MacroStore
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,10 @@ BRIGHTNESS_STEP = 10
 #: What a macro key sends when it has no binding and upstream gives it no key
 #: of its own -- the Fn-layer macro keys of the BlackWidow V3 Mini.
 FN_MACRO_DEFAULTS = {'M1': 'KEY_F13', 'M2': 'KEY_F14', 'M3': 'KEY_F15', 'M4': 'KEY_F16'}
+
+#: Recorded movement is kept at most this often: a gaming mouse reports a
+#: thousand times a second, which would fill a macro in seconds.
+MOVE_INTERVAL_MS = 10
 
 
 @lru_cache(maxsize=1)
@@ -111,17 +115,94 @@ class _Binding:
 
 
 class _Recording:
-    def __init__(self, binding: _Binding, key: Optional[str] = None):
+    def __init__(self, binding: _Binding, key: Optional[str] = None, mouse: bool = False):
         self.binding = binding
         self.key = key
+        self.mouse = mouse
         self.events: list = []
         self.last: Optional[int] = None
+        #: When the last kept movement happened, and a later one not kept yet.
+        self._last_move: Optional[int] = None
+        self._pending_move: Optional[MouseEvent] = None
+        self.full = False
+
+    def _append(self, entry: dict, when: int) -> None:
+        if len(self.events) >= MAX_EVENTS:
+            if not self.full:
+                logger.warning('a macro holds at most %d events; the rest is not recorded',
+                               MAX_EVENTS)
+            self.full = True
+            return
+        delay = 0 if self.last is None else max(0, when - self.last)
+        self.last = when
+        entry['delay'] = min(delay, MAX_DELAY_MS)
+        self.events.append(entry)
+
+    def _flush_move(self) -> None:
+        pending, self._pending_move = self._pending_move, None
+        if pending is not None:
+            self._append({'mouse': 'move', 'x': pending.x, 'y': pending.y}, pending.time)
+            self._last_move = pending.time
 
     def add(self, event: KeyEvent) -> None:
-        delay = 0 if self.last is None else max(0, event.time - self.last)
-        self.last = event.time
-        self.events.append({'vk': event.vk, 'scan': event.scan, 'ext': event.extended,
-                            'down': event.down, 'delay': min(delay, 30000)})
+        self._flush_move()
+        self._append({'vk': event.vk, 'scan': event.scan, 'ext': event.extended,
+                      'down': event.down}, event.time)
+
+    def add_mouse(self, event: MouseEvent) -> None:
+        if event.kind == 'move':
+            if self._last_move is not None and event.time - self._last_move < MOVE_INTERVAL_MS:
+                self._pending_move = event
+                return
+            self._pending_move = event
+            self._flush_move()
+            return
+        self._flush_move()
+        if event.kind == 'wheel':
+            if event.amount:
+                self._append({'mouse': 'wheel', 'amount': event.amount,
+                              'horizontal': event.horizontal}, event.time)
+        elif event.kind in MOUSE_BUTTONS:
+            self._append({'mouse': event.kind, 'down': event.down}, event.time)
+
+    def finish(self, trim_click: bool = False) -> list:
+        """The recorded events, tidied.
+
+        A recording started and stopped with the mouse -- Studio's record and
+        stop buttons -- would otherwise begin with the release of the click
+        that started it and end with the way to the stop button and its click.
+        """
+        self._flush_move()
+        events = list(self.events)
+        # Releases of buttons pressed before recording started.
+        held: set = set()
+        tidy = []
+        for event in events:
+            button = event.get('mouse')
+            if button in MOUSE_BUTTONS:
+                if not event['down'] and button not in held:
+                    continue
+                if event['down']:
+                    held.add(button)
+                else:
+                    held.discard(button)
+            tidy.append(event)
+        events = tidy
+        if trim_click and self.mouse:
+            # The click that stopped it, and the movement that led to it.
+            if len(events) >= 2 and events[-1].get('mouse') == 'left' \
+                    and not events[-1]['down'] and events[-2].get('mouse') == 'left' \
+                    and events[-2]['down']:
+                events = events[:-2]
+                while events and events[-1].get('mouse') == 'move':
+                    events.pop()
+            elif events and events[-1].get('mouse') == 'left' and events[-1]['down']:
+                events = events[:-1]
+                while events and events[-1].get('mouse') == 'move':
+                    events.pop()
+        if events:
+            events[0] = dict(events[0], delay=0)
+        return events
 
 
 class KeyService:
@@ -129,12 +210,13 @@ class KeyService:
 
     def __init__(self, backend, macros: Optional[MacroStore] = None, injector=None,
                  hook=None, launcher: Optional[Callable[[str], None]] = None,
-                 data: Optional[dict] = None):
+                 data: Optional[dict] = None, mouse_hook=None):
         self.backend = backend
         self.data = data or load_key_data()
         self.macros = macros if macros is not None else MacroStore()
         self.injector = injector if injector is not None else Injector()
         self.hook = hook if hook is not None else FilterHook(self.handle_key)
+        self.mouse_hook = mouse_hook if mouse_hook is not None else MouseHook(self.handle_mouse)
         self.launcher = launcher or _launch
         self._lock = threading.RLock()
         self._bindings: dict = {}
@@ -164,6 +246,7 @@ class KeyService:
             bindings = list(self._bindings.values())
         for binding in bindings:
             self.detach(binding.device)
+        self.mouse_hook.stop()
         self.hook.stop()
         if self._worker is not None:
             self._work.put(None)
@@ -228,8 +311,11 @@ class KeyService:
                     binding = self._bindings.pop(serial)
             if binding is None:
                 return
-            if self._recording is not None and self._recording.binding is binding:
+            stopped = self._recording is not None and self._recording.binding is binding
+            if stopped:
                 self._recording = None
+        if stopped:
+            self.mouse_hook.stop()
         binding.stop.set()
 
     def handles(self, device) -> bool:
@@ -300,6 +386,7 @@ class KeyService:
                 elif recording.key == name:
                     # Recording a key's own macro into itself: upstream cancels.
                     self._recording = None
+                    self._work.put(self.mouse_hook.stop)
                     self._work.put(lambda: self._macro_led(binding, recording=False))
                 return
         action = self.macros.get(binding.serial, name)
@@ -347,6 +434,16 @@ class KeyService:
         for binding, target, repeat in actions:
             self._fn_target(binding, target, event.down, repeat)
         return swallow
+
+    def handle_mouse(self, event: MouseEvent) -> None:
+        """Record what the mouse does, while a macro that takes it is being recorded."""
+        if event.injected:
+            # A macro playing, or another program moving the cursor.
+            return
+        with self._lock:
+            recording = self._recording
+            if recording is not None and recording.key and recording.mouse:
+                recording.add_mouse(event)
 
     def _fn_target(self, binding: _Binding, target: str, down: bool, repeat: bool) -> None:
         action = ACTIONS.get(target)
@@ -397,7 +494,8 @@ class KeyService:
         with self._lock:
             recording = self._recording
             if recording is None or recording.binding is not binding:
-                self._recording = _Recording(binding)
+                mouse = bool(self.macros.options().get(RECORD_MOUSE))
+                self._recording = _Recording(binding, mouse=mouse)
                 starting = True
             else:
                 self._recording = None
@@ -405,27 +503,36 @@ class KeyService:
         if starting:
             logger.info('%s: recording a macro; press the macro key to record it to',
                         binding.device.name)
+            if self._recording is not None and self._recording.mouse:
+                self._start_mouse()
             self._macro_led(binding, recording=True, blinking=True)
             return
         self._finish(recording)
 
-    def _finish(self, recording: _Recording) -> Optional[dict]:
+    def _start_mouse(self) -> None:
+        if not self.mouse_hook.start():
+            logger.warning('cannot watch the mouse; only keys are recorded')
+
+    def _finish(self, recording: _Recording, trim_click: bool = False) -> Optional[dict]:
         binding = recording.binding
+        if recording.mouse:
+            self.mouse_hook.stop()
         self._macro_led(binding, recording=False)
         if recording.key is None:
             return None
-        if not recording.events:
+        events = recording.finish(trim_click)
+        if not events:
             # Upstream: finishing with nothing recorded clears the key.
             self.macros.delete(binding.serial, recording.key)
             return None
         try:
             saved = self.macros.set(binding.serial, recording.key,
-                                    {'type': 'keys', 'events': recording.events})
+                                    {'type': 'keys', 'events': events})
         except MacroError:
             logger.warning('could not keep the recorded macro', exc_info=True)
             return None
         logger.info('%s: recorded %d events to %s', binding.device.name,
-                    len(recording.events), recording.key)
+                    len(events), recording.key)
         return saved
 
     # -- playing a binding -------------------------------------------------
@@ -450,20 +557,43 @@ class KeyService:
         kind = action.get('type')
         if kind == 'keys':
             held = set()
+            buttons = set()
+            relative = action.get('moves') == 'relative'
+            last_point = None
             try:
                 for event in action['events']:
                     if event.get('delay'):
                         time.sleep(event['delay'] / 1000.0)
-                    identity = (event['vk'], event['scan'], event['ext'])
-                    self.injector.raw(event['vk'], event['scan'], event['ext'], event['down'])
-                    if event['down']:
-                        held.add(identity)
+                    mouse = event.get('mouse')
+                    if mouse == 'move':
+                        if not relative:
+                            self.injector.mouse_move_to(event['x'], event['y'])
+                        elif last_point is not None:
+                            # The first point is where the path starts from.
+                            self.injector.mouse_move_by(event['x'] - last_point[0],
+                                                        event['y'] - last_point[1])
+                        last_point = (event['x'], event['y'])
+                    elif mouse == 'wheel':
+                        self.injector.mouse_wheel(event['amount'], event.get('horizontal', False))
+                    elif mouse is not None:
+                        self.injector.mouse_button(mouse, event['down'])
+                        if event['down']:
+                            buttons.add(mouse)
+                        else:
+                            buttons.discard(mouse)
                     else:
-                        held.discard(identity)
+                        identity = (event['vk'], event['scan'], event['ext'])
+                        self.injector.raw(event['vk'], event['scan'], event['ext'], event['down'])
+                        if event['down']:
+                            held.add(identity)
+                        else:
+                            held.discard(identity)
             finally:
-                # A macro cut short must not leave Shift held down.
+                # A macro cut short must not leave Shift, or a mouse button, held down.
                 for vk, scan, extended in held:
                     self.injector.raw(vk, scan, extended, False)
+                for button in buttons:
+                    self.injector.mouse_button(button, False)
         elif kind == 'text':
             self.injector.text(action['text'])
         elif kind == 'launch':
@@ -496,18 +626,29 @@ class KeyService:
         order = list(MACRO_KEYS.values())
         return sorted(keys, key=lambda k: order.index(k) if k in order else len(order))
 
-    def start_recording(self, serial: str, key: str) -> None:
-        binding = self._binding_for(serial)
-        with self._lock:
-            self._recording = _Recording(binding, key)
-        self._macro_led(binding, recording=True, blinking=False)
+    def start_recording(self, serial: str, key: str, mouse: Optional[bool] = None) -> bool:
+        """Record onto `key`.  `mouse` None follows the record_mouse option.
 
-    def stop_recording(self) -> Optional[dict]:
+        Returns whether the mouse is being recorded.
+        """
+        binding = self._binding_for(serial)
+        if mouse is None:
+            mouse = bool(self.macros.options().get(RECORD_MOUSE))
+        with self._lock:
+            previous, self._recording = self._recording, _Recording(binding, key, mouse=mouse)
+        if previous is not None and previous.mouse and not mouse:
+            self.mouse_hook.stop()
+        if mouse:
+            self._start_mouse()
+        self._macro_led(binding, recording=True, blinking=False)
+        return mouse
+
+    def stop_recording(self, trim_click: bool = True) -> Optional[dict]:
         with self._lock:
             recording, self._recording = self._recording, None
         if recording is None:
             return None
-        return self._finish(recording)
+        return self._finish(recording, trim_click)
 
     def status(self, devices: list) -> dict:
         with self._lock:
@@ -529,5 +670,5 @@ class KeyService:
             'devices': rows,
             'recording': None if recording is None else {
                 'serial': recording.binding.serial, 'key': recording.key,
-                'events': len(recording.events)},
+                'events': len(recording.events), 'mouse': recording.mouse},
         }

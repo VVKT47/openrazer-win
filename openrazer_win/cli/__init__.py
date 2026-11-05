@@ -373,7 +373,18 @@ hotkeys can use.  Bound, it plays its macro instead:
   openrazer-win macro set M3 --launch "C:\\Windows\\notepad.exe"
   openrazer-win macro set M4 --disable             make the key do nothing
   openrazer-win macro record M5                    type the macro, then Enter
+  openrazer-win macro record M5 --mouse            record the mouse too
   openrazer-win macro clear M1                     back to sending F13
+
+Macros made in Razer Synapse come across with their keys, clicks, scrolling,
+cursor movement and pauses -- export one from Synapse as .xml, then:
+
+  openrazer-win macro import --dry-run "My macro.xml"    see what is in it
+  openrazer-win macro import M1 "My macro.xml"           put it on M1
+  openrazer-win macro import M1 file.xml --relative      move from where the cursor is
+
+and "macro options --record-mouse on" makes Fn+F9 and Studio record the
+mouse as well.
 
 On the keyboard itself, Fn+F9 records a macro: press it, press a macro key,
 type, then Fn+F9 again.  "macro watch" prints the raw key reports, for
@@ -409,12 +420,23 @@ def _macro_devices(client, selector) -> list:
 
 
 def cmd_macro(args) -> int:
-    from ..keys.codes import describe_event, parse_sequence
+    from ..keys.codes import describe_action, parse_sequence
 
     if args.action == 'watch':
         return _macro_watch(args)
+    if args.action == 'import' and args.dry_run:
+        _synapse_macros(args, show=True)
+        return 0
     client = _macro_client()
     try:
+        if args.action == 'options':
+            changes = {}
+            if args.record_mouse is not None:
+                changes['record_mouse'] = args.record_mouse == 'on'
+            options = client.call('macro.options', **changes)
+            print('record the mouse: {0}'.format('on' if options.get('record_mouse') else 'off'))
+            return 0
+
         devices = _macro_devices(client, args.device)
         if args.action == 'list':
             status = client.call('keys.status')
@@ -429,9 +451,9 @@ def cmd_macro(args) -> int:
                     if action is None:
                         what = 'default'
                     elif action['type'] == 'keys':
-                        downs = [describe_event(e) for e in action['events'] if e['down']]
-                        what = 'keys: {0}'.format(' '.join(downs[:12]) + (
-                            ' ...' if len(downs) > 12 else ''))
+                        what = 'keys: {0}'.format(describe_action(action['events']))
+                        if action.get('moves') == 'relative':
+                            what += '  (moves from where the cursor is)'
                     elif action['type'] == 'text':
                         what = 'text: {0!r}'.format(action['text'])
                     elif action['type'] == 'launch':
@@ -441,6 +463,9 @@ def cmd_macro(args) -> int:
                     print('  {0:<6} {1}'.format(key, what))
             return 0
 
+        if args.action == 'import' and args.file is None:
+            raise CliError('"macro import" takes the key, then the file: macro import M1 FILE '
+                           '(or --dry-run FILE to look inside it)')
         if not args.key:
             raise CliError('"macro {0}" needs a key, such as M1'.format(args.action))
         key = args.key.upper()
@@ -469,15 +494,23 @@ def cmd_macro(args) -> int:
             client.call('macro.set', serial=serial, key=key, action=action)
             print('{0}: bound'.format(key))
             return 0
+        if args.action == 'import':
+            macro = _synapse_macros(args, show=True)
+            client.call('macro.set', serial=serial, key=key, action=macro.action)
+            print('{0}: bound to "{1}"'.format(key, macro.name))
+            return 0
         if args.action == 'record':
-            client.call('macro.record_start', serial=serial, key=key)
-            print('Recording {0}: type the macro, then press Enter here.'.format(key))
+            started = client.call('macro.record_start', serial=serial, key=key,
+                                  mouse=args.mouse)
+            print('Recording {0}{1}: do the macro, then press Enter here.'.format(
+                key, ' with the mouse' if started.get('mouse') else ''))
             try:
                 input()
             finally:
-                saved = client.call('macro.record_stop')
+                # Stopped from the keyboard, so a last click is part of the macro.
+                saved = client.call('macro.record_stop', trim_click=False)
             if saved:
-                print('{0}: recorded {1} key events'.format(key, len(saved['events'])))
+                print('{0}: recorded {1} events'.format(key, len(saved['events'])))
             else:
                 print('{0}: nothing recorded; it is back to its default'.format(key))
             return 0
@@ -489,6 +522,43 @@ def cmd_macro(args) -> int:
     finally:
         client.close()
     return 0
+
+
+def _synapse_macros(args, show: bool):
+    """The macro picked from a Synapse file, after printing what is in it."""
+    from ..keys.codes import describe_action
+    from ..keys.synapse import SynapseError, parse
+
+    path = args.file or args.key
+    if not path:
+        raise CliError('"macro import" needs the .xml file Synapse exported')
+    try:
+        macros = parse(path, codes=args.codes, numpad=args.numpad,
+                       keep_delays=not args.no_delays, relative=args.relative)
+    except SynapseError as error:
+        raise CliError(str(error)) from error
+    if args.macro is not None:
+        if args.macro.isdigit() and int(args.macro) < len(macros):
+            macros = [macros[int(args.macro)]]
+        else:
+            macros = [m for m in macros if m.name == args.macro]
+            if not macros:
+                raise CliError('no macro called {0!r} in {1}'.format(args.macro, path))
+    for index, macro in enumerate(macros):
+        events = macro.action['events']
+        seconds = sum(e['delay'] for e in events) / 1000
+        print('{0}{1} ({2}): {3} events, {4:.2f} s'.format(
+            '{0}: '.format(index) if len(macros) > 1 else '', macro.name, macro.version,
+            len(events), seconds))
+        if show:
+            print('  ' + (describe_action(events, limit=24) or 'nothing it can play'))
+        for warning in macro.warnings:
+            print('  warning: ' + warning)
+    if len(macros) > 1 and not args.dry_run:
+        raise CliError('the file has {0} macros; pick one with --macro'.format(len(macros)))
+    if not macros[0].action['events']:
+        raise CliError('nothing in {0!r} can be played'.format(macros[0].name))
+    return macros[0]
 
 
 def _macro_watch(args) -> int:
@@ -1151,9 +1221,28 @@ def build_parser() -> argparse.ArgumentParser:
     macro = add('macro', cmd_macro, 'bind, record and test macro keys',
                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=MACRO_HELP)
     macro.add_argument('action', nargs='?', default='list',
-                       choices=('list', 'set', 'clear', 'record', 'play', 'watch'))
+                       choices=('list', 'set', 'clear', 'record', 'play', 'watch', 'import',
+                                'options'))
     macro.add_argument('key', nargs='?', help='M1-M5, or another macro key the keyboard has')
+    macro.add_argument('file', nargs='?', help='import: the .xml file Razer Synapse exported')
     macro.add_argument('--device', '-d')
+    mouse = macro.add_mutually_exclusive_group()
+    mouse.add_argument('--mouse', action='store_true', default=None,
+                       help='record: take the mouse too (default: macro options)')
+    mouse.add_argument('--no-mouse', dest='mouse', action='store_false',
+                       help='record: keys only')
+    macro.add_argument('--record-mouse', choices=('on', 'off'),
+                       help='options: whether Fn+F9 and Studio record the mouse')
+    synapse = macro.add_argument_group('import from Razer Synapse')
+    synapse.add_argument('--dry-run', action='store_true', help='only show what is in the file')
+    synapse.add_argument('--macro', help='which macro, by name or number, if the file has several')
+    synapse.add_argument('--relative', action='store_true',
+                         help='move the cursor from wherever it is, not to the recorded positions')
+    synapse.add_argument('--numpad', action='store_true',
+                         help='Synapse 3: read the keys it shares with the arrows as the keypad')
+    synapse.add_argument('--codes', choices=('auto', 'scancode', 'vk'), default='auto',
+                         help='scan codes (Synapse 2/3) or virtual keys (Synapse 4); default: tell')
+    synapse.add_argument('--no-delays', action='store_true', help='drop the recorded pauses')
     what = macro.add_mutually_exclusive_group()
     what.add_argument('--keys', help='keys to press, e.g. "ctrl+c" or "win+e, enter"')
     what.add_argument('--text', help='text to type')

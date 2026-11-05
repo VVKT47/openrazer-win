@@ -2,9 +2,19 @@
 
 A binding is one of:
 
-* ``{"type": "keys", "events": [...]}`` -- a recorded or written sequence of
-  key presses and releases, each ``{"vk", "scan", "ext", "down", "delay"}``
-  with the delay in milliseconds before the event;
+* ``{"type": "keys", "events": [...]}`` -- a recorded, written or imported
+  sequence of key presses and releases, each ``{"vk", "scan", "ext", "down",
+  "delay"}`` with the delay in milliseconds before the event.  It may also hold
+  mouse events, told apart by a ``"mouse"`` member:
+
+  - ``{"mouse": "left" | "right" | "middle" | "x1" | "x2", "down", "delay"}``
+  - ``{"mouse": "move", "x", "y", "delay"}`` -- the cursor at x, y in desktop
+    pixels (the same coordinates the primary monitor's top-left corner is 0, 0 in)
+  - ``{"mouse": "wheel", "amount", "horizontal", "delay"}`` -- 120 is one notch,
+    positive is up (or right)
+
+  and ``"moves": "relative"`` on the binding replays movement from wherever the
+  cursor is instead of at the recorded positions;
 * ``{"type": "text", "text": "..."}`` -- typed as is, whatever the layout;
 * ``{"type": "launch", "target": "..."}`` -- a program, document or URL;
 * ``{"type": "disabled"}`` -- the key does nothing at all.
@@ -30,9 +40,22 @@ logger = logging.getLogger(__name__)
 
 TYPES = ('keys', 'text', 'launch', 'disabled')
 
+MOUSE_BUTTONS = ('left', 'right', 'middle', 'x1', 'x2')
+MOVES = ('absolute', 'relative')
+#: Further than any desktop reaches, in pixels.
+MAX_COORDINATE = 100000
+#: A hundred notches in one event is already more than any wheel turns.
+MAX_WHEEL = 12000
+
+#: The option that makes recording take the mouse too.
+RECORD_MOUSE = 'record_mouse'
+OPTIONS = {RECORD_MOUSE: False}
+#: Where the options sit in the file, beside the serial numbers.
+_OPTIONS_KEY = '__options__'
+
 #: Generous limits that still stop a broken client filling the disk or
 #: pinning the daemon in a ten-minute "macro".
-MAX_EVENTS = 1000
+MAX_EVENTS = 10000
 MAX_DELAY_MS = 30000
 MAX_TEXT = 4000
 
@@ -55,21 +78,14 @@ def validate(action) -> dict:
             raise MacroError('a key macro needs at least one event')
         if len(events) > MAX_EVENTS:
             raise MacroError('at most {0} events'.format(MAX_EVENTS))
-        clean = []
-        for event in events:
-            try:
-                vk = int(event.get('vk', 0))
-                scan = int(event.get('scan', 0))
-                delay = int(event.get('delay', 0))
-            except (AttributeError, TypeError, ValueError) as error:
-                raise MacroError('malformed event: {0!r}'.format(event)) from error
-            if not (0 <= vk <= 0xFF and 0 <= scan <= 0xFFFF) or not (vk or scan):
-                raise MacroError('an event needs a virtual key or a scan code')
-            if not 0 <= delay <= MAX_DELAY_MS:
-                raise MacroError('delays are 0-{0} ms'.format(MAX_DELAY_MS))
-            clean.append({'vk': vk, 'scan': scan, 'ext': bool(event.get('ext', False)),
-                          'down': bool(event.get('down', True)), 'delay': delay})
-        return {'type': 'keys', 'events': clean}
+        clean = [_validate_event(event) for event in events]
+        result = {'type': 'keys', 'events': clean}
+        moves = action.get('moves', 'absolute')
+        if moves not in MOVES:
+            raise MacroError('"moves" is absolute or relative')
+        if moves != 'absolute':
+            result['moves'] = moves
+        return result
     if kind == 'text':
         text = action.get('text')
         if not isinstance(text, str) or not text:
@@ -85,6 +101,54 @@ def validate(action) -> dict:
     return {'type': 'disabled'}
 
 
+def _validate_event(event) -> dict:
+    if not isinstance(event, dict):
+        raise MacroError('malformed event: {0!r}'.format(event))
+    try:
+        delay = int(event.get('delay', 0))
+    except (TypeError, ValueError) as error:
+        raise MacroError('malformed event: {0!r}'.format(event)) from error
+    if not 0 <= delay <= MAX_DELAY_MS:
+        raise MacroError('delays are 0-{0} ms'.format(MAX_DELAY_MS))
+    mouse = event.get('mouse')
+    if mouse is None:
+        try:
+            vk = int(event.get('vk', 0))
+            scan = int(event.get('scan', 0))
+        except (TypeError, ValueError) as error:
+            raise MacroError('malformed event: {0!r}'.format(event)) from error
+        if not (0 <= vk <= 0xFF and 0 <= scan <= 0xFFFF) or not (vk or scan):
+            raise MacroError('an event needs a virtual key or a scan code')
+        return {'vk': vk, 'scan': scan, 'ext': bool(event.get('ext', False)),
+                'down': bool(event.get('down', True)), 'delay': delay}
+    try:
+        if mouse in MOUSE_BUTTONS:
+            return {'mouse': mouse, 'down': bool(event.get('down', True)), 'delay': delay}
+        if mouse == 'move':
+            x, y = int(event['x']), int(event['y'])
+            if abs(x) > MAX_COORDINATE or abs(y) > MAX_COORDINATE:
+                raise MacroError('the cursor cannot go to {0}, {1}'.format(x, y))
+            return {'mouse': 'move', 'x': x, 'y': y, 'delay': delay}
+        if mouse == 'wheel':
+            amount = int(event['amount'])
+            if not amount or abs(amount) > MAX_WHEEL:
+                raise MacroError('a wheel turn is 1-{0} (120 is one notch)'.format(MAX_WHEEL))
+            return {'mouse': 'wheel', 'amount': amount,
+                    'horizontal': bool(event.get('horizontal', False)), 'delay': delay}
+    except MacroError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise MacroError('malformed mouse event: {0!r}'.format(event)) from error
+    raise MacroError('unknown mouse event {0!r}; expected one of {1}, move or wheel'.format(
+        mouse, ', '.join(MOUSE_BUTTONS)))
+
+
+def has_mouse(action) -> bool:
+    """Whether a binding does anything with the mouse."""
+    return isinstance(action, dict) and any(
+        'mouse' in event for event in action.get('events') or ())
+
+
 class MacroStore:
     """Bindings per device serial, saved as JSON."""
 
@@ -92,6 +156,7 @@ class MacroStore:
         self.path = path or os.path.join(default_config_dir(), 'macros.json')
         self._lock = threading.RLock()
         self._data: dict = {}
+        self._options: dict = dict(OPTIONS)
         self._load()
 
     def _load(self) -> None:
@@ -104,8 +169,12 @@ class MacroStore:
             logger.warning('ignoring unreadable macro file %s', self.path, exc_info=True)
             return
         if isinstance(data, dict):
+            options = data.get(_OPTIONS_KEY)
+            if isinstance(options, dict):
+                self._options.update({name: type(OPTIONS[name])(value)
+                                      for name, value in options.items() if name in OPTIONS})
             self._data = {serial: keys for serial, keys in data.items()
-                          if isinstance(keys, dict)}
+                          if isinstance(keys, dict) and serial != _OPTIONS_KEY}
 
     def _save(self) -> None:
         directory = os.path.dirname(self.path)
@@ -113,7 +182,10 @@ class MacroStore:
         handle = tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=directory,
                                              delete=False, suffix='.tmp')
         try:
-            json.dump(self._data, handle, indent=1, sort_keys=True)
+            data = dict(self._data)
+            if self._options != OPTIONS:
+                data[_OPTIONS_KEY] = self._options
+            json.dump(data, handle, indent=1, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         finally:
@@ -146,3 +218,18 @@ class MacroStore:
                 self._data.pop(serial, None)
             self._save()
         return True
+
+    def options(self) -> dict:
+        """Settings for macros as a whole, such as whether recording takes the mouse."""
+        with self._lock:
+            return dict(self._options)
+
+    def set_options(self, **changes) -> dict:
+        unknown = sorted(set(changes) - set(OPTIONS))
+        if unknown:
+            raise MacroError('unknown macro option {0}'.format(', '.join(unknown)))
+        with self._lock:
+            for name, value in changes.items():
+                self._options[name] = type(OPTIONS[name])(value)
+            self._save()
+            return dict(self._options)

@@ -86,11 +86,49 @@ pub fn to_events(steps: &[Step]) -> Vec<Value> {
     events
 }
 
+/// Whether an event is the mouse's rather than a key's.
+fn is_mouse(event: &Value) -> bool {
+    event.get("mouse").is_some()
+}
+
+/// Whether a binding does anything with the mouse: those are kept whole, as
+/// recorded or imported, since the step editor only knows keys.
+pub fn has_mouse(action: &Value) -> bool {
+    action["events"].as_array().is_some_and(|events| events.iter().any(is_mouse))
+}
+
+/// What the mouse does in a macro, in a few words, if anything.
+fn mouse_summary(events: &[Value]) -> Option<String> {
+    let clicks = events.iter().filter(|e| is_mouse(e) && e["down"] == true).count();
+    let moves = events.iter().any(|e| e["mouse"] == "move");
+    let scrolls = events.iter().any(|e| e["mouse"] == "wheel");
+    let mut parts: Vec<String> = Vec::new();
+    match clicks {
+        0 => {}
+        1 => parts.push(t("1 click").to_string()),
+        n => parts.push(tf("{} clicks", &[&n])),
+    }
+    if moves {
+        parts.push(t("movement").to_string());
+    }
+    if scrolls {
+        parts.push(t("scrolling").to_string());
+    }
+    (!parts.is_empty()).then(|| tf("Mouse: {}", &[&parts.join(", ")]))
+}
+
+/// How long a macro takes to play, in seconds.
+fn duration(events: &[Value]) -> f64 {
+    events.iter().map(|e| e["delay"].as_u64().unwrap_or(0)).sum::<u64>() as f64 / 1000.0
+}
+
+/// The key steps of a macro; mouse events are left out.
 pub fn from_events(events: &[Value]) -> Vec<Step> {
+    let events: Vec<&Value> = events.iter().filter(|e| !is_mouse(e)).collect();
     let mut steps = Vec::new();
     let mut i = 0;
     while i < events.len() {
-        let e = &events[i];
+        let e = events[i];
         let vk = e["vk"].as_u64().unwrap_or(0) as u8;
         let delay = e["delay"].as_u64().unwrap_or(0) as u32;
         if delay > 0 {
@@ -129,11 +167,15 @@ struct Draft {
     /// When recording started, and when the last key came.
     recording: Option<(Instant, Instant, egui::Modifiers)>,
     pick: u8,
+    /// A macro that uses the mouse, kept exactly as recorded or imported.
+    recorded: Option<Value>,
+    /// ... replayed from wherever the cursor is, rather than at the same places.
+    relative: bool,
 }
 
 impl Draft {
     fn new() -> Draft {
-        Draft { index: None, name: String::new(), kind: Kind::Keys, steps: Vec::new(), text: String::new(), target: String::new(), recording: None, pick: 0x41 }
+        Draft { index: None, name: String::new(), kind: Kind::Keys, steps: Vec::new(), text: String::new(), target: String::new(), recording: None, pick: 0x41, recorded: None, relative: false }
     }
 
     fn from(index: usize, item: &LibraryMacro) -> Draft {
@@ -150,12 +192,27 @@ impl Draft {
                 draft.target = item.action["target"].as_str().unwrap_or_default().into();
             }
             Some("disabled") => draft.kind = Kind::Disabled,
+            _ if has_mouse(&item.action) => {
+                draft.recorded = Some(item.action.clone());
+                draft.relative = item.action["moves"] == "relative";
+            }
             _ => draft.steps = from_events(item.action["events"].as_array().map(Vec::as_slice).unwrap_or(&[])),
         }
         draft
     }
 
     fn action(&self) -> Result<Value, &'static str> {
+        if let (Kind::Keys, Some(recorded)) = (self.kind, &self.recorded) {
+            let mut action = recorded.clone();
+            if let Some(map) = action.as_object_mut() {
+                if self.relative {
+                    map.insert("moves".into(), json!("relative"));
+                } else {
+                    map.remove("moves");
+                }
+            }
+            return Ok(action);
+        }
         Ok(match self.kind {
             Kind::Keys if self.steps.iter().all(|s| matches!(s, Step::Wait(_))) => return Err(t("Add at least one key.")),
             Kind::Keys => json!({ "type": "keys", "events": to_events(&self.steps) }),
@@ -172,12 +229,20 @@ impl Draft {
 pub struct MacrosUi {
     draft: Option<Draft>,
     selected: Option<usize>,
+    /// The last import from Synapse taken into the library.
+    imported: u64,
 }
 
 pub fn page(app: &mut App, ui: &mut egui::Ui, snap: &Snapshot) {
+    take_imported(app, snap);
     widgets::page_header(ui, t("Macros"), t("Make a macro once, then put it on any macro key."), |ui| {
         if ui.add(Button::primary(t("New macro")).icon(icon::ADD)).clicked() {
             new_draft(app);
+        }
+        if ui.add(Button::secondary(t("Import from Synapse")).icon(icon::DOWNLOAD)).on_hover_text(t("Bring over a macro exported from Razer Synapse as .xml: keys, clicks, scrolling, mouse movement and pauses")).clicked() {
+            if let Some(path) = rfd::FileDialog::new().set_title(t("Choose a macro exported from Razer Synapse")).add_filter(t("Synapse macro"), &["xml"]).pick_file() {
+                app.send(Command::ImportSynapse { path: path.display().to_string() });
+            }
         }
     });
     scroll(ui, "macros", |ui| {
@@ -200,6 +265,44 @@ pub fn page(app: &mut App, ui: &mut egui::Ui, snap: &Snapshot) {
             assign(app, ui, snap);
         });
     });
+}
+
+/// Put the macros of a finished Synapse import into the library, once.
+fn take_imported(app: &mut App, snap: &Snapshot) {
+    let Some((number, found)) = &snap.imported else { return };
+    if *number <= app.macros.imported {
+        return;
+    }
+    app.macros.imported = *number;
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut warnings = 0usize;
+    for item in found["macros"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        if item["action"]["events"].as_array().is_none_or(Vec::is_empty) {
+            skipped += 1;
+            continue;
+        }
+        let name = item["name"].as_str().filter(|n| !n.trim().is_empty()).unwrap_or("Synapse");
+        warnings += item["warnings"].as_array().map_or(0, Vec::len);
+        app.settings.macros.push(LibraryMacro { name: name.trim().to_string(), action: item["action"].clone() });
+        added += 1;
+    }
+    if added == 0 {
+        app.toast(t("Nothing in that file can be played here"), true);
+        return;
+    }
+    app.save_settings();
+    let first = app.settings.macros.len() - added;
+    open(app, first);
+    let text = match added {
+        1 => tf("“{}” brought over from Synapse", &[&app.settings.macros[first].name]),
+        n => tf("{} macros brought over from Synapse", &[&n]),
+    };
+    if warnings + skipped > 0 {
+        app.toast(tf("{}; {} parts could not be brought over exactly", &[&text, &(warnings + skipped)]), false);
+    } else {
+        app.toast(text, false);
+    }
 }
 
 /// Open the library's macro `index` in the editor.
@@ -238,6 +341,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
                         Some("text") => icon::TEXT,
                         Some("launch") => icon::OPEN,
                         Some("disabled") => icon::CLOSE,
+                        _ if has_mouse(&item.action) => icon::MOUSE,
                         _ => icon::KEYBOARD,
                     };
                     ui.add_space(2.0);
@@ -263,6 +367,7 @@ fn library(app: &mut App, ui: &mut egui::Ui) {
     widgets::panel(ui, t("Tips"), |ui| {
         widgets::help(ui, t("An unbound macro key sends F13–F17, so any game or app that takes hotkeys can use it as is."));
         widgets::help(ui, t("On the keyboard: Fn + F9 records a macro straight onto a key."));
+        widgets::help(ui, t("Macros from Razer Synapse come over with their clicks, scrolling and mouse movement: export them from Synapse as .xml, then Import from Synapse."));
     });
 }
 
@@ -433,8 +538,58 @@ fn editor(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// A macro that uses the mouse: what it does, and how its movement is replayed.
+/// Its steps are kept as they came, since the step editor only knows keys.
+fn recorded_editor(ui: &mut egui::Ui, draft: &mut Draft) {
+    let Some(recorded) = draft.recorded.as_ref() else { return };
+    let events = recorded["events"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let (text, _) = summary(Some(recorded), "");
+    let length = tf("{} events, {} s", &[&events.len(), &format!("{:.1}", duration(events))]);
+    let moves = events.iter().any(|e| e["mouse"] == "move");
+    let mut start_over = false;
+    widgets::stacked(ui, t("Steps"), |ui| {
+        Frame::new()
+            .fill(theme::WELL)
+            .stroke(Stroke::new(1.0_f32, theme::BORDER_HI))
+            .corner_radius(CornerRadius::same(theme::RADIUS_SM))
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    widgets::icon(ui, icon::MOUSE, 14.0, ACCENT);
+                    ui.label(RichText::new(&text).font(theme::bold(13.0)).color(TEXT));
+                });
+                ui.label(widgets::faint(&length));
+            });
+        widgets::help(ui, t("Recorded with the mouse, or brought over from Razer Synapse: it plays as it was made. To change it, record it again, or start over with key steps."));
+    });
+    if moves {
+        widgets::stacked(ui, t("Mouse movement"), |ui| {
+            let options = vec![(false, t("At the same places").to_string()), (true, t("From where the cursor is").to_string())];
+            widgets::segmented(ui, &options, &mut draft.relative);
+            widgets::help(ui, if draft.relative {
+                t("The cursor follows the same path, starting wherever it is. Games that hide the cursor see this kind of movement.")
+            } else {
+                t("The cursor goes to the same spots on the screen as when the macro was made.")
+            });
+        });
+    }
+    if ui.add(Button::ghost(t("Start over with key steps")).icon(icon::CLEAR).small()).clicked() {
+        start_over = true;
+    }
+    if start_over {
+        draft.recorded = None;
+        draft.relative = false;
+        draft.steps.clear();
+    }
+}
+
 /// Steps of a key macro: recorded, or built one by one.
 fn keys_editor(ui: &mut egui::Ui, draft: &mut Draft) {
+    if draft.recorded.is_some() {
+        recorded_editor(ui, draft);
+        return;
+    }
     let recording = draft.recording.is_some();
     widgets::row(ui, t("Record"), t("Type the macro in this window; pauses are kept."), |ui| {
         if recording {
@@ -596,6 +751,9 @@ pub fn device_keys(app: &mut App, ui: &mut egui::Ui, device: &Device, snap: &Sna
     let bindings = info["bindings"].clone();
     let recording = &snap.keys["recording"];
     let recording_here = recording["serial"] == serial.as_str();
+    let record_mouse = info["options"]["record_mouse"] == true;
+    // Sent once the panel is drawn: its header and body cannot both hold `app`.
+    let mut set_mouse: Option<bool> = None;
 
     widgets::panel_with(
         ui,
@@ -607,6 +765,18 @@ pub fn device_keys(app: &mut App, ui: &mut egui::Ui, device: &Device, snap: &Sna
                 widgets::badge(ui, t("Idle"), theme::WARN).on_hover_text(t("The daemon could not read this keyboard's key report, so its macro keys do nothing. Bindings can still be set up."));
             } else {
                 widgets::badge(ui, t("Off"), theme::WARN).on_hover_text(t("The daemon runs without key handling (--no-keys). Restart it normally to use macro keys."));
+            }
+            // An older daemon has no such option, and could not record the mouse.
+            if info.get("options").is_some() {
+                ui.add_space(8.0);
+                let mut on = record_mouse;
+                ui.add_enabled_ui(!recording_here, |ui| {
+                    if widgets::toggle(ui, &mut on).on_hover_text(t("Record clicks, scrolling and mouse movement along with the keys — with the record button here, and with Fn + F9 on the keyboard")).changed() {
+                        set_mouse = Some(on);
+                    }
+                });
+                widgets::icon(ui, icon::MOUSE, 13.0, if record_mouse { ACCENT } else { TEXT_FAINT });
+                ui.label(widgets::faint(t("Record the mouse too")));
             }
         },
         |ui| {
@@ -624,7 +794,7 @@ pub fn device_keys(app: &mut App, ui: &mut egui::Ui, device: &Device, snap: &Sna
                         let room = (ui.available_width() - tools).max(60.0);
                         let (rect, response) = ui.allocate_exact_size(vec2(room, 32.0), Sense::hover());
                         let (line, colour) = if live {
-                            (tf("Recording… {} keys so far", &[&recording["events"].as_u64().unwrap_or(0)]), theme::DANGER)
+                            (tf("Recording… {} events so far", &[&recording["events"].as_u64().unwrap_or(0)]), theme::DANGER)
                         } else {
                             (text.clone(), if bound { TEXT } else { TEXT_DIM })
                         };
@@ -650,8 +820,11 @@ pub fn device_keys(app: &mut App, ui: &mut egui::Ui, device: &Device, snap: &Sna
                                 if ui.add(IconButton::new(icon::STOP, t("Stop recording")).danger().on(true).size(30.0)).clicked() {
                                     app.send(Command::MacroRecordStop { serial: serial.clone() });
                                 }
-                            } else if ui.add(IconButton::new(icon::RECORD, t("Record on the keyboard: type the macro anywhere, then stop")).size(30.0).enabled(handled && !recording_here)).clicked() {
-                                app.send(Command::MacroRecordStart { serial: serial.clone(), key: key.clone() });
+                            } else {
+                                let tip = if record_mouse { t("Record: type and use the mouse anywhere, then stop") } else { t("Record on the keyboard: type the macro anywhere, then stop") };
+                                if ui.add(IconButton::new(icon::RECORD, tip).size(30.0).enabled(handled && !recording_here)).clicked() {
+                                    app.send(Command::MacroRecordStart { serial: serial.clone(), key: key.clone(), mouse: record_mouse });
+                                }
                             }
                             let mut chosen: Option<usize> = None;
                             ui.add_enabled_ui(!live, |ui| {
@@ -676,6 +849,9 @@ pub fn device_keys(app: &mut App, ui: &mut egui::Ui, device: &Device, snap: &Sna
             }
         },
     );
+    if let Some(on) = set_mouse {
+        app.send(Command::MacroRecordMouse { serial, on });
+    }
 }
 
 /// One line saying what a binding does.
@@ -697,7 +873,8 @@ pub fn summary(action: Option<&Value>, key: &str) -> (String, bool) {
     };
     let text = match action["type"].as_str().unwrap_or_default() {
         "keys" => {
-            let steps = from_events(action["events"].as_array().map(Vec::as_slice).unwrap_or(&[]));
+            let events = action["events"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let steps = from_events(events);
             let mut chords: Vec<String> = Vec::new();
             let mut held: Vec<String> = Vec::new();
             for step in steps {
@@ -722,7 +899,11 @@ pub fn summary(action: Option<&Value>, key: &str) -> (String, bool) {
             if chords.len() > 6 {
                 shown.push_str(" …");
             }
-            tf("Presses {}", &[&shown])
+            match (chords.is_empty(), mouse_summary(events)) {
+                (true, Some(mouse)) => mouse,
+                (false, Some(mouse)) => format!("{} · {}", tf("Presses {}", &[&shown]), mouse),
+                _ => tf("Presses {}", &[&shown]),
+            }
         }
         "text" => tf("Types “{}”", &[&truncate(action["text"].as_str().unwrap_or_default(), 48)]),
         "launch" => tf("Opens {}", &[&truncate(action["target"].as_str().unwrap_or_default(), 56)]),
@@ -760,6 +941,50 @@ mod tests {
         set_english();
         let action = json!({"type": "keys", "events": to_events(&[Step::Down(0xA2), Step::Tap(0x43), Step::Up(0xA2), Step::Tap(0x70)])});
         assert_eq!(summary(Some(&action), "M1").0, "Presses Ctrl+C, F1");
+    }
+
+    #[test]
+    fn mouse_events_are_left_out_of_the_steps() {
+        let events = vec![
+            json!({"mouse": "left", "down": true, "delay": 0}),
+            json!({"vk": 0x41, "scan": 0, "ext": false, "down": true, "delay": 5}),
+            json!({"mouse": "move", "x": 1, "y": 2, "delay": 0}),
+            json!({"vk": 0x41, "scan": 0, "ext": false, "down": false, "delay": 0}),
+            json!({"mouse": "left", "down": false, "delay": 0}),
+        ];
+        assert_eq!(from_events(&events), vec![Step::Wait(5), Step::Tap(0x41)], "a press let go at once, with the mouse between, is still a tap");
+        assert!(has_mouse(&json!({"type": "keys", "events": events})));
+        assert!(!has_mouse(&json!({"type": "keys", "events": to_events(&[Step::Tap(0x41)])})));
+    }
+
+    #[test]
+    fn a_mouse_macro_says_what_the_mouse_does() {
+        set_english();
+        let clicks = json!({"type": "keys", "events": [
+            {"mouse": "left", "down": true, "delay": 0}, {"mouse": "left", "down": false, "delay": 0},
+            {"mouse": "right", "down": true, "delay": 0}, {"mouse": "right", "down": false, "delay": 0},
+            {"mouse": "move", "x": 1, "y": 2, "delay": 0}, {"mouse": "wheel", "amount": -120, "delay": 0},
+        ]});
+        assert_eq!(summary(Some(&clicks), "M1").0, "Mouse: 2 clicks, movement, scrolling");
+        let mut both = to_events(&[Step::Down(0xA2), Step::Tap(0x43), Step::Up(0xA2)]);
+        both.push(json!({"mouse": "left", "down": true, "delay": 0}));
+        let action = json!({"type": "keys", "events": both});
+        assert_eq!(summary(Some(&action), "M1").0, "Presses Ctrl+C · Mouse: 1 click");
+    }
+
+    #[test]
+    fn a_mouse_macro_is_kept_whole_when_saved_again() {
+        let action = json!({"type": "keys", "events": [
+            {"mouse": "move", "x": 5, "y": 6, "delay": 0}, {"vk": 0x41, "scan": 30, "ext": false, "down": true, "delay": 9},
+        ]});
+        let mut draft = Draft::from(0, &LibraryMacro { name: "m".into(), action: action.clone() });
+        assert!(draft.recorded.is_some() && draft.steps.is_empty());
+        assert_eq!(draft.action().unwrap(), action);
+        draft.relative = true;
+        assert_eq!(draft.action().unwrap()["moves"], "relative");
+        assert_eq!(draft.action().unwrap()["events"], action["events"]);
+        let relative = Draft::from(0, &LibraryMacro { name: "m".into(), action: draft.action().unwrap() });
+        assert!(relative.relative);
     }
 
     #[test]

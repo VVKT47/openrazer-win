@@ -206,10 +206,39 @@ def _event(key, down: bool) -> dict:
 
 def describe_event(event: dict) -> str:
     """A short readable name for one recorded event, for listings."""
+    mouse = event.get('mouse')
+    if mouse == 'move':
+        return 'move({0},{1})'.format(event.get('x'), event.get('y'))
+    if mouse == 'wheel':
+        notches = event.get('amount', 0) / 120
+        return 'wheel{0}{1:+g}'.format('-h' if event.get('horizontal') else '', notches)
+    if mouse is not None:
+        return 'mouse-{0}'.format(mouse)
     for name, key in KEYS.items():
         if event.get('scan') and key.scan == event['scan'] and key.extended == event.get('ext'):
             return name[4:]
     for name, vk in VIRTUAL_KEYS.items():
         if vk == event.get('vk'):
             return name[4:]
+    if 0x60 <= event.get('vk', 0) <= 0x69:
+        return 'KP{0}'.format(event['vk'] - 0x60)
     return 'vk{0:02x}'.format(event.get('vk', 0))
+
+
+def describe_action(events: list, limit: int = 12) -> str:
+    """A one-line summary of a key and mouse macro."""
+    words = []
+    moves = 0
+    for event in events:
+        if event.get('mouse') == 'move':
+            moves += 1
+            continue
+        if moves:
+            words.append('[moves x{0}]'.format(moves) if moves > 1 else '[move]')
+            moves = 0
+        if event.get('down', True) or event.get('mouse') == 'wheel':
+            words.append(describe_event(event))
+    if moves:
+        words.append('[moves x{0}]'.format(moves) if moves > 1 else '[move]')
+    text = ' '.join(words[:limit])
+    return text + (' ...' if len(words) > limit else '')

@@ -105,6 +105,9 @@ pub struct Snapshot {
     pub synapse: Vec<(u32, String)>,
     /// Razer devices plugged in that the port has no data for.
     pub unsupported: Vec<(u16, String)>,
+    /// Macros read from a Razer Synapse export, for the library to take in:
+    /// a number that grows with every import, and the `macro.import_synapse` result.
+    pub imported: Option<(u64, Value)>,
 }
 
 pub enum Command {
@@ -119,7 +122,12 @@ pub enum Command {
     Profile { action: &'static str, serial: String, name: String, quiet: bool },
     MacroSet { serial: String, key: String, action: Value },
     MacroDelete { serial: String, key: String },
-    MacroRecordStart { serial: String, key: String },
+    /// `mouse`: take the mouse too.
+    MacroRecordStart { serial: String, key: String, mouse: bool },
+    /// Whether recording takes the mouse when not told: Fn + F9 on the keyboard.
+    MacroRecordMouse { serial: String, on: bool },
+    /// Read a macro export from Razer Synapse; the result arrives in `imported`.
+    ImportSynapse { path: String },
     MacroRecordStop { serial: String },
     MacroPlay { serial: String, key: String },
     StartDaemon,
@@ -517,10 +525,31 @@ impl Worker {
                 self.report(&result, Some(tf("{} is back to its default", &[&key])));
                 self.reload_macros(&serial);
             }
-            Command::MacroRecordStart { serial, key } => {
-                let result = self.with(|c| c.call("macro.record_start", json!({ "serial": serial, "key": key })));
-                self.report(&result, Some(tf("Recording {}: type the macro, then press Stop", &[&key])));
+            Command::MacroRecordStart { serial, key, mouse } => {
+                let result = self.with(|c| c.call("macro.record_start", json!({ "serial": serial, "key": key, "mouse": mouse })));
+                let text = if mouse {
+                    tf("Recording {}: type and use the mouse, then press Stop", &[&key])
+                } else {
+                    tf("Recording {}: type the macro, then press Stop", &[&key])
+                };
+                self.report(&result, Some(text));
                 self.reload_macros(&serial);
+            }
+            Command::MacroRecordMouse { serial, on } => {
+                let result = self.with(|c| c.call("macro.options", json!({ "record_mouse": on })));
+                self.report(&result, None);
+                self.reload_macros(&serial);
+            }
+            Command::ImportSynapse { path } => {
+                let result = self.with(|c| c.call("macro.import_synapse", json!({ "path": path })));
+                match result {
+                    Ok(found) => {
+                        let mut shared = self.shared.lock().unwrap();
+                        let number = shared.imported.as_ref().map_or(1, |(n, _)| n + 1);
+                        shared.imported = Some((number, found));
+                    }
+                    Err(error) => self.toast(error.to_string(), true),
+                }
             }
             Command::MacroRecordStop { serial } => {
                 let result = self.with(|c| c.call("macro.record_stop", json!({})));
@@ -528,7 +557,7 @@ impl Worker {
                     Ok(Value::Null) => self.toast(t("Nothing was recorded; the key is back to its default"), false),
                     Ok(saved) => {
                         let count = saved["events"].as_array().map_or(0, Vec::len);
-                        self.toast(tf("Recorded {} key events", &[&count]), false)
+                        self.toast(tf("Recorded {} events", &[&count]), false)
                     }
                     Err(error) => self.toast(error.to_string(), true),
                 }
